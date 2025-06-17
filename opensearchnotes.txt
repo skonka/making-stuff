@@ -1,0 +1,62 @@
+provider "aws" {
+  region = var.aws_region
+}
+
+resource "aws_opensearch_domain" "main" {
+  domain_name    = var.domain_name
+  engine_version = "OpenSearch_2.9"
+
+  cluster_config {
+    instance_type            = var.instance_type
+    instance_count          = var.data_node_count
+    dedicated_master_enabled = true
+    dedicated_master_type   = var.master_instance_type
+    dedicated_master_count  = var.master_node_count
+    zone_awareness_enabled  = var.multi_az_enabled
+
+    zone_awareness_config {
+      availability_zone_count = var.multi_az_enabled ? 3 : 1
+    }
+  }
+
+  ebs_options {
+    ebs_enabled = true
+    volume_size = var.ebs_volume_size
+    volume_type = "gp3"
+  }
+
+  encrypt_at_rest {
+    enabled = true
+    kms_key_id = aws_kms_key.opensearch.arn
+  }
+
+  node_to_node_encryption {
+    enabled = true
+  }
+
+  domain_endpoint_options {
+    enforce_https       = true
+    tls_security_policy = "Policy-Min-TLS-1-2-2019-07"
+  }
+
+  advanced_security_options {
+    enabled                        = true
+    internal_user_database_enabled = false
+    master_user_options {
+      master_user_iam_arn = var.master_user_arn
+    }
+  }
+
+  advanced_options = {
+    "rest.action.multi.allow_explicit_index" = "true"
+    "auth.idp.saml.entityId"                = var.adfs_entity_id
+    "auth.idp.saml.metadataUrl"             = var.adfs_metadata_url
+    "auth.idp.saml.sp.x509"                 = file(var.saml_sp_cert_path)
+    "auth.idp.saml.sp.private_key"          = file(var.saml_sp_key_path)
+    "auth.idp.saml.roles_key"               = "http://schemas.microsoft.com/ws/2008/06/identity/claims/role"
+    "auth.idp.saml.subject_key"             = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"
+    "auth.type"                             = "saml"
+  }
+
+  tags = local.tags
+}

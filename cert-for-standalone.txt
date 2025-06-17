@@ -1,0 +1,157 @@
+#!/bin/bash
+
+# Set strict error handling
+set -euo pipefail
+IFS=$'\n\t'
+
+# Configuration
+readonly TOMCAT_HOME="/opt/tomcat"
+readonly KEYSTORE_PATH="${TOMCAT_HOME}/conf/keystore.jks"
+readonly KEYSTORE_PASSWORD=$(head -c 32 /dev/urandom | base64)
+readonly CERT_ALIAS="tomcat"
+readonly VENAFI_URL="https://venafi.example.com"
+readonly CYBERARK_CLI="/opt/CARKaim/sdk/clipasswordsdk"
+readonly CYBERARK_APPID="TomcatApp"
+readonly CYBERARK_SAFE="TomcatSafe"
+readonly CYBERARK_OBJECT="VenafiAPI"
+readonly LOG_FILE="/var/log/tomcat/cert_renewal.log"
+
+# Function for secure logging (no sensitive data)
+log() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "${timestamp} - $1" | tee -a "${LOG_FILE}"
+}
+
+# Function to clean up sensitive data
+cleanup() {
+    if [[ -n "${VENAFI_API_KEY:-}" ]]; then
+        VENAFI_API_KEY="0000000000000000"
+        unset VENAFI_API_KEY
+    fi
+    
+    if [[ -d "${TEMP_DIR:-}" ]]; then
+        find "${TEMP_DIR}" -type f -exec shred -u {} \;
+        rm -rf "${TEMP_DIR}"
+    fi
+    
+    # Clear any remaining sensitive variables
+    if [[ -n "${KEYSTORE_PASSWORD:-}" ]]; then
+        unset KEYSTORE_PASSWORD
+    fi
+}
+
+# Error handler
+error_handler() {
+    local line_no=$1
+    local error_code=$2
+    log "Error: Script failed at line ${line_no} with error code ${error_code}"
+    cleanup
+    exit "${error_code}"
+}
+
+# Set up trap for cleanup and errors
+trap 'error_handler ${LINENO} $?' ERR
+trap cleanup EXIT
+
+# Verify script is running as tomcat user
+if [[ "$(id -un)" != "tomcat" ]]; then
+    log "Error: Script must be run as tomcat user"
+    exit 1
+fi
+
+# Create temporary directory with restricted permissions
+TEMP_DIR=$(mktemp -d)
+chmod 700 "${TEMP_DIR}"
+cd "${TEMP_DIR}" || exit 1
+
+log "Starting certificate renewal process"
+
+# Fetch Venafi API key from CyberArk
+log "Fetching credentials from CyberArk"
+VENAFI_API_KEY=$("${CYBERARK_CLI}" GetPassword \
+    -p AppDescs.AppID="${CYBERARK_APPID}" \
+    -p Query="Safe=${CYBERARK_SAFE};Object=${CYBERARK_OBJECT}" \
+    -o Password)
+
+if [[ -z "${VENAFI_API_KEY}" ]]; then
+    log "Error: Failed to retrieve Venafi API key"
+    exit 1
+fi
+
+# Generate CSR and private key
+log "Generating certificate request"
+readonly CERT_FILE="${TEMP_DIR}/cert.pem"
+readonly KEY_FILE="${TEMP_DIR}/key.pem"
+readonly CSR_FILE="${TEMP_DIR}/request.csr"
+readonly P12_FILE="${TEMP_DIR}/cert.p12"
+
+# Generate private key and CSR
+openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "${KEY_FILE}" \
+    -out "${CSR_FILE}" \
+    -subj "/CN=$(hostname -f)/O=Organization/C=US"
+
+# Fetch certificate from Venafi TPP
+log "Requesting certificate from Venafi TPP"
+HTTP_RESPONSE=$(curl -s -w "%{http_code}" -X POST \
+    "${VENAFI_URL}/vedsdk/certificates/request" \
+    -H "Content-Type: application/json" \
+    -H "X-Venafi-Api-Key: ${VENAFI_API_KEY}" \
+    -d "{
+        \"PolicyDN\": \"\\VED\\Policy\\Certificates\\Tomcat\",
+        \"PKCS10\": \"$(cat "${CSR_FILE}" | tr -d '\n')\",
+        \"ObjectName\": \"$(hostname -f)\"
+    }" \
+    --output "${CERT_FILE}")
+
+if [[ "${HTTP_RESPONSE}" != "200" ]]; then
+    log "Error: Failed to fetch certificate from Venafi. HTTP Response: ${HTTP_RESPONSE}"
+    exit 1
+fi
+
+# Validate certificate
+if ! openssl x509 -in "${CERT_FILE}" -noout > /dev/null 2>&1; then
+    log "Error: Invalid certificate received from Venafi"
+    exit 1
+fi
+
+# Convert to PKCS12
+log "Converting certificate to PKCS12 format"
+openssl pkcs12 -export \
+    -in "${CERT_FILE}" \
+    -inkey "${KEY_FILE}" \
+    -out "${P12_FILE}" \
+    -name "${CERT_ALIAS}" \
+    -passout "pass:${KEYSTORE_PASSWORD}"
+
+# Backup existing keystore
+if [[ -f "${KEYSTORE_PATH}" ]]; then
+    cp "${KEYSTORE_PATH}" "${KEYSTORE_PATH}.$(date +%Y%m%d_%H%M%S).backup"
+fi
+
+# Import into keystore
+log "Importing certificate into Tomcat keystore"
+keytool -importkeystore \
+    -deststorepass "${KEYSTORE_PASSWORD}" \
+    -destkeystore "${KEYSTORE_PATH}" \
+    -srckeystore "${P12_FILE}" \
+    -srcstoretype PKCS12 \
+    -srcstorepass "${KEYSTORE_PASSWORD}" \
+    -alias "${CERT_ALIAS}" \
+    -noprompt
+
+# Set secure permissions
+chown tomcat:tomcat "${KEYSTORE_PATH}"
+chmod 600 "${KEYSTORE_PATH}"
+
+# Update Tomcat configuration
+sed -i "s/keystorePass=\"[^\"]*\"/keystorePass=\"${KEYSTORE_PASSWORD}\"/" \
+    "${TOMCAT_HOME}/conf/server.xml"
+
+# Restart Tomcat
+log "Restarting Tomcat service"
+systemctl restart tomcat
+
+log "Certificate renewal completed successfully"
+exit 0
