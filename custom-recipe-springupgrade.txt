@@ -1,0 +1,39 @@
+package org.openrewrite.spring.upgrade;
+
+import org.openrewrite.Recipe;
+import org.openrewrite.java.ChangePropertyValue;
+import org.openrewrite.maven.UpgradeDependencyVersion;
+import org.openrewrite.maven.ChangeManagedDependencyVersion;
+
+public class SpringCloudGatewayUpgrade2024 extends Recipe {
+    @Override
+    public String getDisplayName() {
+        return "Upgrade Spring Cloud Gateway to 2024.x";
+    }
+
+    @Override
+    public String getDescription() {
+        return "Upgrades Spring Cloud Gateway and related dependencies to 2024.x compatible versions.";
+    }
+
+    @Override
+    protected List<Recipe> getRecipeList() {
+        return Arrays.asList(
+            // Upgrade Spring Boot to 3.2.x
+            new UpgradeDependencyVersion("org.springframework.boot", "*", "3.2.+", null),
+            new ChangeManagedDependencyVersion("org.springframework.boot", "spring-boot-dependencies", "3.2.+", null),
+
+            // Upgrade Spring Cloud to 2024.x
+            new UpgradeDependencyVersion("org.springframework.cloud", "*", "2024.0.+", null),
+            new ChangeManagedDependencyVersion("org.springframework.cloud", "spring-cloud-dependencies", "2024.0.+", null),
+
+            // Upgrade specific Gateway dependencies
+            new UpgradeDependencyVersion("org.springframework.cloud", "spring-cloud-starter-gateway", "4.1.+", null),
+            new UpgradeDependencyVersion("org.springframework.cloud", "spring-cloud-gateway-server", "4.1.+", null),
+
+            // Update properties if needed
+            new ChangePropertyValue("spring.cloud.gateway.httpclient.pool.type", "ELASTIC", null, true),
+            new ChangePropertyValue("spring.cloud.gateway.filter.secure-headers.enabled", "true", null, true)
+        );
+    }
+}
