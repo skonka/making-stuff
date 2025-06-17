@@ -1,0 +1,203 @@
+To integrate **OpenSearch Dashboards** with **SAML authentication via your organization’s ADFS**, and enforce access using **AWS STS and IAM roles**, you need to federate your ADFS with AWS IAM (SAML federation), then configure OpenSearch Dashboards to authenticate users using that federated SAML identity.
+
+---
+
+## ✅ What You'll Achieve
+
+* Users log in via **your organization's ADFS**.
+* ADFS issues a **SAML assertion**.
+* AWS **STS** assumes a role based on the SAML assertion.
+* That **IAM role** maps to permissions in **OpenSearch Dashboards**.
+
+---
+
+## 🧭 Integration Architecture
+
+```
+[User] 
+   ↓ (Access OpenSearch Dashboards)
+[OpenSearch Dashboards]
+   ↓ (SAML Redirect)
+[ADFS SAML IdP] ←→ [Active Directory]
+   ↓ (SAML Assertion)
+[AWS STS] ← IAM trust policy
+   ↓ (Assume Role)
+[IAM Role] → Mapped to OpenSearch Security Role
+```
+
+---
+
+## 🛠️ Step-by-Step Guide
+
+### 🟢 Step 1: Configure IAM for SAML Federation
+
+#### 1.1 Create IAM SAML Provider (once per IdP)
+
+Download the ADFS metadata XML from:
+
+```
+https://<your-adfs-domain>/FederationMetadata/2007-06/FederationMetadata.xml
+```
+
+Then run:
+
+```bash
+aws iam create-saml-provider \
+  --saml-metadata-document file://adfs_metadata.xml \
+  --name ADFS
+```
+
+#### 1.2 Create IAM Role Trusted for ADFS
+
+Create an IAM role with trust relationship:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<ACCOUNT_ID>:saml-provider/ADFS"
+      },
+      "Action": "sts:AssumeRoleWithSAML",
+      "Condition": {
+        "StringEquals": {
+          "SAML:aud": "https://signin.aws.amazon.com/saml"
+        }
+      }
+    }
+  ]
+}
+```
+
+Attach permissions like:
+
+* `AmazonOpenSearchServiceReadOnlyAccess`
+* Or custom access to OpenSearch APIs
+
+---
+
+### 🟢 Step 2: Configure ADFS to Trust AWS
+
+#### 2.1 Create Relying Party Trust for AWS
+
+* Relying Party Identifier: `urn:amazon:webservices`
+* SSO URL: `https://signin.aws.amazon.com/saml`
+
+#### 2.2 Create ADFS Claim Rules
+
+Rule 1: Send LDAP attributes as claims
+
+```text
+Name ID → UPN or email
+```
+
+Rule 2: Transform Name ID (optional)
+
+Rule 3: Custom claim to send role info:
+
+```
+Rule Type: Send Claims Using a Custom Rule
+Claim rule name: Send IAM Role
+Custom rule:
+  => 
+  => c:[Type == "http://schemas.microsoft.com/ws/2008/06/identity/claims/groupsid"]
+     => issue(Type = "https://aws.amazon.com/SAML/Attributes/Role", 
+               Value = "arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>,arn:aws:iam::<ACCOUNT_ID>:saml-provider/ADFS");
+```
+
+---
+
+### 🟢 Step 3: Configure OpenSearch Domain for SAML (If using AWS Managed OpenSearch)
+
+Go to AWS Console → OpenSearch → Your Domain → Security → SAML:
+
+* **SAML metadata**: Use ADFS metadata URL or XML
+* **Entity ID**: e.g., `urn:amazon:webservices`
+* **Roles Key**: `https://aws.amazon.com/SAML/Attributes/Role`
+* **Subject Key**: `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`
+
+Map IAM roles to OpenSearch roles:
+
+```json
+{
+  "arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>": "all_access",
+  "arn:aws:iam::<ACCOUNT_ID>:role/<READ_ONLY_ROLE>": "read_only"
+}
+```
+
+---
+
+### 🟢 Step 4: Configure OpenSearch Dashboards (Self-Managed)
+
+If you are self-hosting OpenSearch, update `opensearch.yml`:
+
+```yaml
+opensearch_security.authc:
+  saml_auth_domain:
+    http_enabled: true
+    transport_enabled: false
+    order: 1
+    http_authenticator:
+      type: saml
+      challenge: true
+      config:
+        idp.metadata_url: https://<your-adfs-domain>/FederationMetadata/2007-06/FederationMetadata.xml
+        idp.entity_id: https://<your-adfs-domain>/adfs/services/trust
+        sp.entity_id: opensearch-dashboards
+        kibana_url: https://<your-dashboards-url>
+        roles_key: "https://aws.amazon.com/SAML/Attributes/Role"
+    authentication_backend:
+      type: noop
+```
+
+And update `roles_mapping.yml`:
+
+```yaml
+all_access:
+  backend_roles:
+    - "arn:aws:iam::<ACCOUNT_ID>:role/OpenSearchAdminRole"
+
+read_only:
+  backend_roles:
+    - "arn:aws:iam::<ACCOUNT_ID>:role/OpenSearchReadOnlyRole"
+```
+
+---
+
+### 🧪 Step 5: Test the Flow
+
+1. Access OpenSearch Dashboards
+2. You're redirected to ADFS
+3. Authenticate with org credentials
+4. ADFS sends SAML assertion with role
+5. AWS STS assumes IAM role
+6. OpenSearch uses role mapping to assign permissions
+7. You land in Dashboards with correct access
+
+---
+
+## 🧩 Optional Enhancements
+
+| Feature                   | How                                                      |
+| ------------------------- | -------------------------------------------------------- |
+| MFA                       | Enforce in ADFS or federated AWS login                   |
+| Session Timeout           | Control in IAM role/session duration                     |
+| Attribute Mapping         | Adjust `roles_key` and `subject_key` in config           |
+| Use Cognito (alternative) | Use ADFS as IdP in Cognito, and federate with OpenSearch |
+
+---
+
+## 📌 Summary
+
+| Component  | Status                                     |
+| ---------- | ------------------------------------------ |
+| ADFS       | SAML IdP with claim rules                  |
+| AWS IAM    | Role with trust to ADFS SAML               |
+| STS        | Issues temp creds based on SAML            |
+| OpenSearch | Configured to accept SAML + IAM role       |
+| Dashboards | Auth via ADFS, access via IAM role mapping |
+
+---
+
